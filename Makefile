@@ -1,0 +1,2 @@
+all:
+	maturin develop
