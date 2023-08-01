@@ -12,17 +12,10 @@ import json
 
 from mlwl import dedup_wordlist # Rust library
 
-# Gensim Word2Vec models to use. MAX_SIMILAR words will be retrieved from all models listed
+# Gensim Word2Vec models that are supported. MAX_SIMILAR words will be retrieved from all models listed
 # here. Keep this in mind when defining MAX_SIMILAR and when creating your input wordlist,
 # as this may generate a very large wordlist.
 GENSIM_W2V_MODELS = ["conceptnet-numberbatch-17-06-300", "word2vec-google-news-300", "glove-twitter-200", "fasttext-wiki-news-subwords-300", "glove-wiki-gigaword-300"]
-
-MIN_SIMILARITY_SPACY = 0.2
-MAX_SIMILAR = 1000 # Maximum amount of similar words to find for each keyword.
-WORD_VARIATIONS = True # Should variate words on input and output. Faster if False.
-WORD_SPLIT = True # Gensim outputs multiple words separated by underscore. If this is true, will copy and split them on output.
-DEDUP = True # Deduplicate input and output words.
-NUM_THREADS = 6
 
 # preprocess_keywords returns an expanded keywords list by preprocessing the input keywords list.
 # This ensures that we have good tokens for finding similar words without getting rid
@@ -53,10 +46,10 @@ def preprocess_keywords(keywords):
     return keywords + tokens
 
 # get_similar_from_gensim takes an input list of strings and returns the most similar strings
-# by getting similar from each Word2Vec model that is passed.
-def get_similar_from_gensim(keywords, progress, progress_i):
+# by getting similar from each Word2Vec model that is passed. Returned list is not deduplicated.
+def get_similar_from_gensim(keywords, progress, progress_i, no_variate, no_split, use_models, similar_count):
     models = []
-    for model_name in GENSIM_W2V_MODELS:
+    for model_name in use_models:
         models.append((model_name, gensim.models.keyedvectors.KeyedVectors.load("{}.normed".format(model_name), mmap="r")))
         models[-1][1].vectors_norm = models[-1][1].vectors
 
@@ -71,9 +64,9 @@ def get_similar_from_gensim(keywords, progress, progress_i):
             try:
                 # Handle conceptnet URI
                 if model_name == "conceptnet-numberbatch-17-06-300":
-                    most_similar = model.most_similar("/c/en/{}".format(keyword), topn=MAX_SIMILAR)
+                    most_similar = model.most_similar("/c/en/{}".format(keyword), topn=similar_count)
                 else:
-                    most_similar = model.most_similar(keyword, topn=MAX_SIMILAR)
+                    most_similar = model.most_similar(keyword, topn=similar_count)
             except Exception as e: # Model does not contain this keyword so do nothing.
                 #print(e)
                 continue
@@ -83,7 +76,7 @@ def get_similar_from_gensim(keywords, progress, progress_i):
                 # Handle conceptnet URI
                 if model_name == "conceptnet-numberbatch-17-06-300":
                     w = w.split("/")[-1]
-                for variation in get_word_variations(w):
+                for variation in get_word_variations(w, no_variate, no_split):
                     similar_words.append("{}\n".format(variation))
         
         progress[progress_i] += 1
@@ -92,22 +85,8 @@ def get_similar_from_gensim(keywords, progress, progress_i):
 
 # most_similar_gensim takes input keywords string list, preprocess them concurrently with nltk, 
 # and concurrently gets similar words using all the chosen Word2Vec models. Returns a list
-# of the keywords + similar words. The returned list is not deduplicated, so there will
-# likely be repeated words. 
-def most_similar_gensim(keywords):
-    import gensim.downloader as api
-    nltk.download('punkt')
-    nltk.download('stopwords')
-    nltk.download('wordnet')
-
-    # See https://stackoverflow.com/questions/51616074/sharing-memory-for-gensims-keyedvectors-objects-between-docker-containers
-    for model_name in GENSIM_W2V_MODELS:
-        if not os.path.exists("{}.normed".format(model_name)):
-            print("Saving normed gensim Word2Vec model {}...".format(model_name))
-            model = api.load(model_name)
-            model.init_sims(replace=True)
-            model.save("{}.normed".format(model_name))
-
+# of the keywords + similar words.
+def most_similar_gensim(keywords, no_variate, no_split, no_dedup, num_threads, models, similar_count):
     similar_words = None
 
     print("Splitting keywords among threads...")
@@ -115,14 +94,14 @@ def most_similar_gensim(keywords):
 
     for keyword in keywords:
         # If we already added the max amount we are submitting to each thread, go to next input list.
-        if len(keywords_threads[-1]) == round(len(keywords) / NUM_THREADS) and len(keywords_threads) < NUM_THREADS:
+        if len(keywords_threads[-1]) == round(len(keywords) / num_threads) and len(keywords_threads) < num_threads:
             keywords_threads.append([])
         
         keywords_threads[-1].append(keyword)
 
-    print("Getting similar words concurrently with {} threads".format(NUM_THREADS))
+    print("Getting similar words concurrently with {} threads".format(len(keywords_threads)))
     with multiprocessing.Manager() as manager:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_THREADS) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_threads) as executor:
             # First preprocess all keywords concurrently.
             print("Preprocessing keywords concurrently...")
             preprocess_queue = manager.list()
@@ -158,14 +137,14 @@ def most_similar_gensim(keywords):
             for future in futures_preprocess:
                 keyword_set += future.result()
 
-            if DEDUP:
+            if not no_dedup:
                 print("Deduping preprocessed keywords...")
                 keyword_set = dedup_wordlist(keyword_set)
 
             print("Concurrently getting words based on {} preprocessed keywords".format(len(keyword_set)))
             for keyword in keyword_set:
                 # If we already added the max amount we are submitting to each thread, go to next input list.
-                if len(keywords_threads[-1]) == round(len(keyword_set) // NUM_THREADS) and len(keywords_threads) < NUM_THREADS:
+                if len(keywords_threads[-1]) == round(len(keyword_set) // num_threads) and len(keywords_threads) < num_threads:
                     keywords_threads.append([])
                 
                 keywords_threads[-1].append(keyword)
@@ -175,9 +154,11 @@ def most_similar_gensim(keywords):
             totals = []
             wq = manager.list()
 
+            # Start getting similar words with gensim.
             progress_index = 0
             for keywords_thread in keywords_threads:
-                future = executor.submit(get_similar_from_gensim, keywords_thread, progress, progress_index)
+                future = executor.submit(get_similar_from_gensim, keywords_thread, progress, 
+                    progress_index, no_variate, no_split, models, similar_count)
                 futures.append(future)
 
                 totals.append(len(keywords_thread))
@@ -221,12 +202,12 @@ def most_similar_gensim(keywords):
 
 # get_word_variations takes an input string and returns a list of variations of the word. 
 # Looks for certain seperator characters and replaces them.
-def get_word_variations(word):
+def get_word_variations(word, no_variate, no_split):
     variations = [word]
 
     replace_chars = [".", " ", "-", "_", "@"]
 
-    if WORD_VARIATIONS:
+    if not no_variate:
         for c in replace_chars:
             if c in word:
                 # Replace all replace chars with all other replace chars.
@@ -241,7 +222,7 @@ def get_word_variations(word):
                         variations.append(token)
 
     # Split into multiple words on underscore. Also remove the underscore and combine them too.
-    if WORD_SPLIT:
+    if not no_split:
         full_word = ""
         if len(word.split("_")) > 1:
             for token in word.split("_"):
@@ -257,9 +238,20 @@ def main():
     parser = argparse.ArgumentParser(
         prog='mlwl',
         description='Use machine learning to generate wordlists for hash cracking!')
-    parser.add_argument('in_keywords_path')
-    parser.add_argument('out_wordlist_path')
-    
+    parser.add_argument('in_keywords_path', help="Path to list of input words.")
+    parser.add_argument('out_wordlist_path', help="Path to output wordlist file.")
+    parser.add_argument("--nv", "--no-variate", default=False, action="store_true", 
+        help="Do not create additional variations of input and output words based on delimeter replacement.")
+    parser.add_argument("-s", "--similar-count", default=100, 
+        help="Number of similar words to get from each model for each input keyword. Default: 100")
+    parser.add_argument("-t", "--thread-count", default=4, help="Number of threads to use. Default: 4")
+    parser.add_argument("--nd", "--no-dedup", default=False, action="store_true", 
+        help="Do not remove duplicate input and output words.")
+    parser.add_argument("--ns", "--no-split", default=False, action="store_true",
+        help="Do not split Word2Vec words by underscore delimeter. By default, both the unsplit and split words are kept.")
+    parser.add_argument("-m", "--models", default=GENSIM_W2V_MODELS,
+        help="List of Word2Vec models to use, separated by spaces. Default: {}".format(" ".join(GENSIM_W2V_MODELS)))
+
     args = parser.parse_args()
     file_path_in = args.in_keywords_path
     file_path_out = args.out_wordlist_path
@@ -272,8 +264,8 @@ def main():
             for line in f:
                 k = line.strip().lower()
 
-                if WORD_VARIATIONS:
-                    for k_variation in get_word_variations(k):
+                if not args.nv:
+                    for k_variation in get_word_variations(k, args.nv, args.ns):
                         if k_variation not in keywords:
                             keywords.append(k_variation)
                 else:
@@ -296,11 +288,30 @@ def main():
     except Exception as e:
         print("Error: Could not open output file. {}".format(e))
 
+    # Download Gensim W2V models.
+    import gensim.downloader as api
+    nltk.download('punkt')
+    nltk.download('stopwords')
+    nltk.download('wordnet')
+
+    # See https://stackoverflow.com/questions/51616074/sharing-memory-for-gensims-keyedvectors-objects-between-docker-containers
+    for model_name in args.models:
+        if model_name in GENSIM_W2V_MODELS:
+            if not os.path.exists("{}.normed".format(model_name)):
+                print("Saving normed gensim Word2Vec model {}...".format(model_name))
+                model = api.load(model_name)
+                model.init_sims(replace=True)
+                model.save("{}.normed".format(model_name))
+        else:
+            print("Error: {} is not a supported Gensim Word2Vec model!".format(model_name))
+            return
+
     final_list = []
 
-    similar_words = most_similar_gensim(keywords)
+    similar_words = most_similar_gensim(keywords, args.nv, args.ns, args.nd, 
+        args.thread_count, args.models, args.similar_count)
 
-    if DEDUP:
+    if not args.nd:
         print("Deduping wordlist...")
         similar_words = dedup_wordlist(similar_words)
 

@@ -16,7 +16,7 @@ make
 
 To run the program and see the available arguments:
 ```bash
-python3 mlwl/mlwl.py
+python3 python/mlwl/mlwl.py
 ```
 
 On first run, mlwl will download and save all supported Word2Vec models. Subsequent runs will be much faster than the initial run because of this.
